@@ -13,6 +13,7 @@ Every RPC request contains the following fields:
     rpc: string, possible values are "PING", "FIND_NODE", "FIND_VALUE", "STORE"
     type: "REQ"
     echo: random 160 bit value encoded as hex string, needs to be echoed back in reply
+    src: the requester's id
 
     Additional fields for PING: None
     Additional fields for FIND_NODE: id: string, 160 bit node id as hex string
@@ -25,6 +26,8 @@ Every RPC reply contains the following fields:
     rpc and echo as above
 
     type: "REP"
+
+    src: the replier's id
 
     Additional fields for PING: None
     Additional fields for FIND_NODE: nodes: list of tuples with ("address",port) pairs
@@ -76,9 +79,10 @@ class KademliaListenProtocol(asyncio.DatagramProtocol):
 # class that stores peer information such as ID, address and alive status
 # which is important for updating the routing table
 class KademliaPeer:
-    def __init__(self,id,addr,event_loop,alive=True,timeout=5):
+    def __init__(self,id,peer_addr,own_id,event_loop,alive=True,timeout=5):
         self.id = id
-        self.addr = addr
+        self.peer_addr = peer_addr
+        self.own_id = own_id
         self.event_loop = event_loop
         self.alive = alive
         # timeout after which the peer is considered dead after sending a request
@@ -95,7 +99,7 @@ class KademliaPeer:
 
         conn = self.event_loop.create_datagram_endpoint(
             lambda: KademliaRPCProtocol(req),
-            local_addr=self.addr,
+            remote_addr=self.peer_addr,
             reuse_port=True)
 
         await self.event_loop.ensure_future(conn)
@@ -114,7 +118,7 @@ class KademliaPeer:
     async def ping(self):
         self.expected_echo = hex(random.randint(0,2**160-1))
 
-        req = { "rpc": "PING", "type": "REQ",
+        req = { "rpc": "PING", "type": "REQ", "src": self.own_id,
                 "echo": self.expected_echo}
 
         await rep = self.generic_request(req)
@@ -130,7 +134,7 @@ class KademliaPeer:
     async def find_node(self,id):
         self.expected_echo = hex(random.randint(0,2**160-1))
 
-        req = { "rpc": "FIND_NODE", "type": "REQ",
+        req = { "rpc": "FIND_NODE", "type": "REQ", "src": self.own_id,
                 "echo": self.expected_echo,
                 "id": id}
 
@@ -147,7 +151,7 @@ class KademliaPeer:
     async def find_value(self,key):
         self.expected_echo = hex(random.randint(0,2**160-1))
 
-        req = { "rpc": "FIND_VALUE", "type": "REQ",
+        req = { "rpc": "FIND_VALUE", "type": "REQ", "src": self.own_id,
                 "echo": self.expected_echo,
                 "key": key}
 
@@ -171,7 +175,7 @@ class KademliaPeer:
     async def store(self,key,value):
         self.expected_echo = hex(random.randint(0,2**160-1))
 
-        req = { "rpc": "STORE", "type": "REQ",
+        req = { "rpc": "STORE", "type": "REQ", "src": self.own_id,
                 "echo": self.expected_echo,
                 "key": key,
                 "value": value}
@@ -181,9 +185,26 @@ class KademliaPeer:
         self.response = None
         return
 
-class KademliaKBucket:
-    def __init__(self,event_loop,bucket_size=20):
+    # reply  to this node
+    async def reply(self,rep):
+
+        conn = self.event_loop.create_datagram_endpoint(
+            lambda: KademliaRPCProtocol(rep),
+            remote_addr=self.peer_addr,
+            reuse_port=True)
+
+        await self.event_loop.ensure_future(conn)
+
+class KademliaNode:
+    def __init__(self,id,addr,event_loop,bucket_size=20,concurrency=3):
+        self.id = id
+        self.addr = addr
         self.event_loop = event_loop
+        # queues messages received from other Kademlia nodes
+        self.message_queue = deque()
+        # concurrency parameter
+        self.concurrency = concurrency
+
         # size of one k-bucket in the routing table
         self.bucket_size = bucket_size
         # initialize k buckets
@@ -191,22 +212,77 @@ class KademliaKBucket:
         # remember when we last performed a node lookup in the ith bucket
         self.lookup_times = [0 for i in range(160)]
 
-    # calculate the index in the kbucket list which is the position of
-    # the most significant bit in the binary representation of the id
-    # this relies on the bin() function not returning leading zeros
-    def id_to_bucket(self,id):
-        return len(bin(int(id,16))[2:])-1
+        # add the listener task to the event queue
+        listener = self.event_loop.create_datagram_endpoint(
+            lambda: KademliaListenProtocol(self.message_queue),
+            local_addr=self.addr,
+            reuse_addr=True,
+            reuse_port=True)
+        self.event_loop.ensure_future(listener)
 
-    # find the KademliaPeer object with the given id in the k buckets
-    def find_peer(self,id):
-        bucket_index = self.id_to_bucket(id)
+        # initially we're not bootstrapped, user has to kick off the
+        # bootstrap procedure by registering that task with the event loop
+        self.bootstrapped = False
 
-        try:
-            peer = [p for p in self.kbuckets[bucket_index] if p.id == id][0]
-        except IndexError:
-            return None
-        else:
-            return peer
+    # kick off the bootstrap process of joining the network
+    async def bootstrap(self):
+        pass
+
+    # work on the incoming message queue
+    async def process_message_queue(self):
+        while True:
+            # retrieve first message
+            current_message = self.message_queue.popleft()
+
+            if current_message.type = "REQ":
+                await self.serve_request(current_message)
+            elif current_message.type = "REP":
+                # find the replying node in the Kbuckets and deliver the message
+                peer = self.find_peer(current_message.id)
+                if peer != None:
+                    peer.response = current_message
+
+                # update the routing table
+                await self.update_kbucket(peer)
+
+            yield
+
+
+    # compose a reply to the passed in request
+    async def serve_request(self,req,value=None):
+
+        peer = KademliaPeer(id=current_message.id,
+                            peer_addr=current_message.addr,
+                            own_id=self.id,
+                            event_loop=self.event_loop)
+
+        if req.type == "PING" or req.type == "STORE":
+            rep = {"src": self.id, "type": "REP", "echo": req.echo}
+            await peer.reply(rep)
+
+        elif req.type == "FIND_NODE":
+
+            # get the intial k-bucket index which contains the closest known
+            # nodes to the given ID
+            initial_kbucket = self.id_to_bucket(distance(self.id,req.id))
+            # reply with k nodes
+            nodes = []
+            while len(nodes) < self.bucket_size:
+                tmp = self.kbuckets[initial_kbucket][1:self.bucket_size-len(nodes)]
+                for i in len(tmp)
+                    nodes.append((tmp.addr,tmp.id))
+                initial_kbucket = initial_kbucket - 1
+
+            rep = {"src": self.id, "type": "REP", "echo": req.echo,
+                   "nodes": nodes}
+
+            await peer.reply(rep)
+
+        elif req.type == "FIND_VALUE":
+
+        # update the routing table
+        await self.update_kbucket(peer)
+
 
     # update the appropriate kbucket using the given KademliaPeer object
     async def update_kbucket(self,peer):
@@ -233,37 +309,22 @@ class KademliaKBucket:
         def distance(self,id1,id2):
             return int(id1,16) ^ int(id2,16)
 
-class KademliaNode:
-    def __init__(self,id,addr,event_loop,bucket_size=20,concurrency=3):
-        self.id = id
-        self.addr = addr
-        self.event_loop = event_loop
-        # queues messages received from other Kademlia nodes
-        self.message_queue = deque()
-        # concurrency parameter
-        self.concurrency = concurrency
+        # calculate the index in the kbucket list which is the position of
+        # the most significant bit in the binary representation of the id
+        # this relies on the bin() function not returning leading zeros
+        def id_to_bucket(self,id):
+            return len(bin(int(id,16))[2:])-1
 
-        self.routing_table = KademliaKBucket(bucket_size=bucket_size)
+        # find the KademliaPeer object with the given id in the k buckets
+        def find_peer(self,id):
+            bucket_index = self.id_to_bucket(id)
 
-        # add the listener task to the event queue
-        listener = self.event_loop.create_datagram_endpoint(
-            lambda: KademliaListenProtocol(self.message_queue),
-            local_addr=self.addr,
-            reuse_addr=True,
-            reuse_port=True)
-        self.event_loop.ensure_future(listener)
-
-        # initially we're not bootstrapped, user has to kick off the
-        # bootstrap procedure by registering that task with the event loop
-        self.bootstrapped = False
-
-    # kick off the bootstrap process of joining the network
-    async def bootstrap(self):
-        pass
-
-    # work on the incoming message queue
-    async def process_message_queue(self):
-        pass
+            try:
+                peer = [p for p in self.kbuckets[bucket_index] if p.id == id][0]
+            except IndexError:
+                return None
+            else:
+                return peer
 
 if __name__ == "__main__":
 
