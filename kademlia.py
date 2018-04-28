@@ -21,6 +21,8 @@ Every RPC request contains the following fields:
     Additional fields for STORE: key: string, 160 bit key as hex string
                                  val: string, 160 bit key as hex string
 
+   {"rpc": "PING", "type": "REQ", "echo": "f7ff9e8b7bb2e09b70935a5d785e0cc5d9d0abf0", "id": "70c07ec18ef89c5309bbb0937f3a6342411e1fdd"}
+
 Every RPC reply contains the following fields:
 
     rpc and echo as above
@@ -51,7 +53,7 @@ class KademliaRPCProtocol(asyncio.DatagramProtocol):
         except:
             print("Error serializing RPC request")
         else:
-            transport.send_to(tmp)
+            transport.sendto(tmp)
         finally:
             transport.close()
 
@@ -74,7 +76,7 @@ class KademliaListenProtocol(asyncio.DatagramProtocol):
             print("Error deserializing received data")
         else:
             tmp = {"addr": addr}
-            self.message_queue.append({**addr, **req})
+            self.message_queue.append({**tmp, **req})
 
 # class that stores peer information such as ID, address and alive status
 # which is important for updating the routing table
@@ -94,25 +96,38 @@ class KademliaPeer:
         # the expected random echo value
         self.expected_echo = None
 
+    # wait for a reply to come in
+    async def wait_response():
+        while self.response == None:
+            await asyncio.sleep(0.01)
+        tmp = self.response
+        self.response = None
+        return tmp
+
     # launch a generic request
     async def generic_request(self,req):
+        # make sure the response field is none otherwise we might be getting
+        # in trouble later
+        self.response = None
 
         conn = self.event_loop.create_datagram_endpoint(
             lambda: KademliaRPCProtocol(req),
             remote_addr=self.peer_addr,
             reuse_port=True)
 
-        await self.event_loop.ensure_future(conn)
+        # not sure about this yet yep -->
+        # conn is a task therefore a future therefore can be awaited
+        await self.event_loop.create_task(conn)
 
-        t_start = time.now()
+        try:
+            rep = await asyncio.wait_for(self.wait_response(),self.timeout)
+        except asyncio.TimeoutError:
+            rep = None
 
-        while self.response == None or self.response.echo != self.expected_echo:
-            while (time.now() - t_start) < self.timeout:
-                yield
-            else:
-                return None
-        else:
-            return self.response
+        if rep["echo"] != self.expected_echo:
+            rep = None
+
+        return rep
 
     # ping this node to see if it is still alive
     async def ping(self):
@@ -121,14 +136,11 @@ class KademliaPeer:
         req = { "rpc": "PING", "type": "REQ", "src": self.own_id,
                 "echo": self.expected_echo}
 
-        await rep = self.generic_request(req)
+        rep = await self.generic_request(req)
 
         # if the reply is a None object then the node timed out or responded
         # with an incorrect echo
         self.alive = rep != None
-
-        self.response = None
-        return
 
     # send a find_node rpc to this node
     async def find_node(self,id):
@@ -138,12 +150,10 @@ class KademliaPeer:
                 "echo": self.expected_echo,
                 "id": id}
 
-        await rep = self.generic_request(req)
+        rep = await self.generic_request(req)
 
         if rep != None:
-            tmp = self.response.nodes
-            self.response = None
-            return tmp
+            return rep["nodes"]
         else:
             return None
 
@@ -155,19 +165,14 @@ class KademliaPeer:
                 "echo": self.expected_echo,
                 "key": key}
 
-        await rep = self.generic_request(req)
+        rep = await self.generic_request(req)
 
         if rep != None:
-
             try:
-                tmp = self.response.value
+                tmp = rep["value"]
             except KeyError:
-                tmp = self.response.nodes
-            finally:
-                self.response = None
-
+                tmp = rep["nodes"]
             return tmp
-
         else:
             return None
 
@@ -180,20 +185,19 @@ class KademliaPeer:
                 "key": key,
                 "value": value}
 
-        await rep = self.generic_request(req)
+        rep = await self.generic_request(req)
 
         self.response = None
-        return
 
     # reply  to this node
     async def reply(self,rep):
-
         conn = self.event_loop.create_datagram_endpoint(
             lambda: KademliaRPCProtocol(rep),
             remote_addr=self.peer_addr,
+            reuse_address=True,
             reuse_port=True)
 
-        await self.event_loop.ensure_future(conn)
+        await self.event_loop.create_task(conn)
 
 class KademliaNode:
     def __init__(self,id,addr,event_loop,bucket_size=20,concurrency=3):
@@ -216,9 +220,10 @@ class KademliaNode:
         listener = self.event_loop.create_datagram_endpoint(
             lambda: KademliaListenProtocol(self.message_queue),
             local_addr=self.addr,
-            reuse_addr=True,
+            reuse_address=True,
             reuse_port=True)
-        self.event_loop.ensure_future(listener)
+
+        self.event_loop.create_task(listener)
 
         # initially we're not bootstrapped, user has to kick off the
         # bootstrap procedure by registering that task with the event loop
@@ -226,60 +231,66 @@ class KademliaNode:
 
     # kick off the bootstrap process of joining the network
     async def bootstrap(self):
-        pass
+
+
+        self.event_loop.create_task(self.process_message_queue())
 
     # work on the incoming message queue
     async def process_message_queue(self):
         while True:
             # retrieve first message
-            current_message = self.message_queue.popleft()
+            try:
+                current_message = self.message_queue.popleft()
 
-            if current_message.type = "REQ":
-                await self.serve_request(current_message)
-            elif current_message.type = "REP":
-                # find the replying node in the Kbuckets and deliver the message
-                peer = self.find_peer(current_message.id)
-                if peer != None:
-                    peer.response = current_message
+                if current_message["type"] == "REQ":
+                    await self.serve_request(current_message)
+                elif current_message["type"] == "REP":
+                    # find the replying node in the Kbuckets and deliver the message
+                    peer = self.find_peer(current_message.id)
+                    if peer != None:
+                        peer.response = current_message
 
-                # update the routing table
-                await self.update_kbucket(peer)
+                    # update the routing table
+                    await self.update_kbucket(peer)
 
-            yield
+            # nothing in the queue
+            except IndexError:
+                pass
 
+            await asyncio.sleep(0.01)
 
     # compose a reply to the passed in request
     async def serve_request(self,req,value=None):
 
-        peer = KademliaPeer(id=current_message.id,
-                            peer_addr=current_message.addr,
+        peer = KademliaPeer(id=req["id"],
+                            peer_addr=req["addr"],
                             own_id=self.id,
                             event_loop=self.event_loop)
 
-        if req.type == "PING" or req.type == "STORE":
-            rep = {"src": self.id, "type": "REP", "echo": req.echo}
+        if req["rpc"] == "PING" or req["rpc"] == "STORE":
+            rep = {"src": self.id, "type": "REP", "echo": req["echo"]}
             await peer.reply(rep)
 
-        elif req.type == "FIND_NODE":
+        elif req["rpc"] == "FIND_NODE":
 
             # get the intial k-bucket index which contains the closest known
             # nodes to the given ID
-            initial_kbucket = self.id_to_bucket(distance(self.id,req.id))
+            initial_kbucket = self.id_to_bucket(distance(self.id,req["id"]))
             # reply with k nodes
             nodes = []
             while len(nodes) < self.bucket_size:
                 tmp = self.kbuckets[initial_kbucket][1:self.bucket_size-len(nodes)]
-                for i in len(tmp)
+                for i in len(tmp):
                     nodes.append((tmp.addr,tmp.id))
                 initial_kbucket = initial_kbucket - 1
 
-            rep = {"src": self.id, "type": "REP", "echo": req.echo,
+            rep = {"src": self.id, "type": "REP", "echo": req["echo"],
                    "nodes": nodes}
 
             await peer.reply(rep)
 
-        elif req.type == "FIND_VALUE":
-
+        elif req["rpc"] == "FIND_VALUE":
+            pass
         # update the routing table
         await self.update_kbucket(peer)
 
@@ -292,9 +303,8 @@ class KademliaNode:
             self.kbuckets[bucket_index].remove(peer)
             self.kbuckets[bucket_index].append(peer)
 
-        elif self.kbuckets[bucket_index].size() < self.bucket_size:
+        elif len(self.kbuckets[bucket_index]) < self.bucket_size:
             self.kbuckets[bucket_index].append(peer)
-
         else:
             # ping the least recently seen node == first node in the deque
             lrs_peer = self.kbuckets[bucket_index].popleft()
@@ -305,26 +315,26 @@ class KademliaNode:
             else:
                 self.kbuckets[bucket_index].append(peer)
 
-        # calculate the Kademlia distance metric given two id strings
-        def distance(self,id1,id2):
-            return int(id1,16) ^ int(id2,16)
+    # calculate the Kademlia distance metric given two id strings
+    def distance(self,id1,id2):
+        return int(id1,16) ^ int(id2,16)
 
-        # calculate the index in the kbucket list which is the position of
-        # the most significant bit in the binary representation of the id
-        # this relies on the bin() function not returning leading zeros
-        def id_to_bucket(self,id):
-            return len(bin(int(id,16))[2:])-1
+    # calculate the index in the kbucket list which is the position of
+    # the most significant bit in the binary representation of the id
+    # this relies on the bin() function not returning leading zeros
+    def id_to_bucket(self,id):
+        return len(bin(int(id,16))[2:])-1
 
-        # find the KademliaPeer object with the given id in the k buckets
-        def find_peer(self,id):
-            bucket_index = self.id_to_bucket(id)
+    # find the KademliaPeer object with the given id in the k buckets
+    def find_peer(self,id):
+        bucket_index = self.id_to_bucket(id)
 
-            try:
-                peer = [p for p in self.kbuckets[bucket_index] if p.id == id][0]
-            except IndexError:
-                return None
-            else:
-                return peer
+        try:
+            peer = [p for p in self.kbuckets[bucket_index] if p.id == id][0]
+        except IndexError:
+            return None
+        else:
+            return peer
 
 if __name__ == "__main__":
 
@@ -334,7 +344,7 @@ if __name__ == "__main__":
         kn = KademliaNode(id='2ef7bde608ce5404e97d5f042f95f89f1c232871',
                           addr=('127.0.0.1',5000),
                           event_loop=loop)
-        loop.run_until_complete(kn.bootstrap())
+        loop.create_task(kn.bootstrap())
         loop.run_forever()
 
     finally:
