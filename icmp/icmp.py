@@ -18,7 +18,7 @@ class ICMPMessage:
             self.checksum = self.calc_checksum()
 
     @classmethod
-    def from_bytestring(cls, bytestring):
+    def from_bytes(cls, bytestring):
         (mtype, code, checksum, header) = struct.unpack(">BBHL",bytestring[:8])
         payload = bytestring[8:]
         return cls(mtype,code,header,payload,checksum)
@@ -56,8 +56,3 @@ class ICMPEchoRequest(ICMPMessage):
         header  = ((ident & 0xFFFF)<<16) | (seqnum & 0xFFFF)
         payload = struct.pack(">Q",int(time.time())) +  bytes(range(14,56))
         super().__init__(mtype=8,code=0,header=header,payload=payload)
-
-
-class ICMPEchoReply(ICMPMessage):
-    def __init__(self,request):
-        pass
