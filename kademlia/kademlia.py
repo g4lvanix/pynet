@@ -2,7 +2,7 @@
 
 import asyncio,json
 from collections import deque
-import time,random
+import time,random,itertools
 
 '''
 Messages passed between nodes are simply Python dictionaries that are
@@ -97,7 +97,7 @@ class KademliaPeer:
         self.expected_echo = None
 
     # wait for a reply to come in
-    async def wait_response():
+    async def wait_response(self):
         while self.response == None:
             await asyncio.sleep(0.01)
         tmp = self.response
@@ -121,10 +121,9 @@ class KademliaPeer:
 
         try:
             rep = await asyncio.wait_for(self.wait_response(),self.timeout)
+            if rep["echo"] != self.expected_echo:
+                rep = None
         except asyncio.TimeoutError:
-            rep = None
-
-        if rep["echo"] != self.expected_echo:
             rep = None
 
         return rep
@@ -209,6 +208,9 @@ class KademliaNode:
         # concurrency parameter
         self.concurrency = concurrency
 
+        # storage area
+        self.storage = {}
+
         # size of one k-bucket in the routing table
         self.bucket_size = bucket_size
         # initialize k buckets
@@ -241,7 +243,9 @@ class KademliaNode:
             # retrieve first message
             try:
                 current_message = self.message_queue.popleft()
-
+            except IndexError: # nothing in the queue
+                pass
+            else:   
                 if current_message["type"] == "REQ":
                     await self.serve_request(current_message)
                 elif current_message["type"] == "REP":
@@ -253,56 +257,71 @@ class KademliaNode:
                     # update the routing table
                     await self.update_kbucket(peer)
 
-            # nothing in the queue
-            except IndexError:
-                pass
-
             await asyncio.sleep(0.01)
 
     # compose a reply to the passed in request
-    async def serve_request(self,req,value=None):
+    async def serve_request(self,req):
 
         peer = KademliaPeer(id=req["id"],
                             peer_addr=req["addr"],
                             own_id=self.id,
                             event_loop=self.event_loop)
 
-        if req["rpc"] == "PING" or req["rpc"] == "STORE":
+        rep = None
+
+        if req["rpc"] == "PING":
             rep = {"src": self.id, "type": "REP", "echo": req["echo"]}
-            await peer.reply(rep)
+
+        elif req["rpc"] == "STORE":
+            tmp = {req["key"]: req["val"]}
+            self.storage = {**self.storage,**tmp} 
+            rep = {"src": self.id, "type": "REP", "echo": req["echo"]}
 
         elif req["rpc"] == "FIND_NODE":
-
-            # get the intial k-bucket index which contains the closest known
-            # nodes to the given ID
-            initial_kbucket = self.id_to_bucket(distance(self.id,req["id"]))
-            # reply with k nodes
-            nodes = []
-            while len(nodes) < self.bucket_size:
-                tmp = self.kbuckets[initial_kbucket][1:self.bucket_size-len(nodes)]
-                for i in len(tmp):
-                    nodes.append((tmp.addr,tmp.id))
-                initial_kbucket = initial_kbucket - 1
+            nodes = self.find_closest_nodes(req["id"])
 
             rep = {"src": self.id, "type": "REP", "echo": req["echo"],
                    "nodes": nodes}
 
-            await peer.reply(rep)
-
         elif req["rpc"] == "FIND_VALUE":
-            pass
+            try:
+                val = self.storage[req["key"]]
+                rep = {"src": self.id, "type": "REP", 
+                        "echo": req["echo"], "value": val}
+            except KeyError:
+                nodes = self.find_closest_nodes(req["key"]) 
+                rep = {"src": self.id, "type": "REP", "echo": req["echo"],
+                   "nodes": nodes}
+       
+        await peer.reply(rep)
+            
         # update the routing table
         await self.update_kbucket(peer)
 
+
+    # find the k closest nodes to the given id
+    def find_closest_nodes(self,id):
+        # get the intial k-bucket index which contains the closest known
+        # nodes to the given ID
+        initial_kbucket = self.id_to_bucket(str(self.distance(self.id,id)))
+        # reply with k nodes
+        it = itertools.chain.from_iterable(deque(self.kbuckets).rotate(-initial_kbucket))
+
+        nodes = []
+
+        try:
+            nodes = [next(it) for i in range(self.bucket_size)]
+        except StopIteration:
+            pass
+
+        return nodes
 
     # update the appropriate kbucket using the given KademliaPeer object
     async def update_kbucket(self,peer):
         bucket_index = self.id_to_bucket(peer.id)
 
         if peer in self.kbuckets[bucket_index]:
-            self.kbuckets[bucket_index].remove(peer)
-            self.kbuckets[bucket_index].append(peer)
-
+            self.kbuckets[bucket_index].rotate(-1)
         elif len(self.kbuckets[bucket_index]) < self.bucket_size:
             self.kbuckets[bucket_index].append(peer)
         else:
