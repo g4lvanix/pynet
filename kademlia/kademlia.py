@@ -299,20 +299,18 @@ class KademliaNode:
         await self.update_kbucket(peer)
 
 
-    # find the k closest nodes to the given id
+    # find the k closest nodes to the given id and return a list of tuples (addr,id)
     def find_closest_nodes(self,id):
         # get the intial k-bucket index which contains the closest known
         # nodes to the given ID
         initial_kbucket = self.id_to_bucket(str(self.distance(self.id,id)))
         # reply with k nodes
-        it = itertools.chain.from_iterable(deque(self.kbuckets).rotate(-initial_kbucket))
+        tmp = deque(self.kbuckets)
+        tmp.rotate(-initial_kbucket)
+        it = itertools.chain.from_iterable(tmp)
 
-        nodes = []
-
-        try:
-            nodes = [next(it) for i in range(self.bucket_size)]
-        except StopIteration:
-            pass
+        peers = (next(it) for i in range(self.bucket_size))
+        nodes = [(p.peer_addr[0],p.peer_addr[1],p.id) for p in peers] 
 
         return nodes
 
