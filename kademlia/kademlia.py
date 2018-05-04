@@ -88,9 +88,8 @@ class KademliaPeer:
         self.event_loop = event_loop
         self.alive = alive
         # timeout after which the peer is considered dead after sending a request
-        self.timeout = 5
-
-        # this property is set by the KademliaNode class when it finds a response
+        self.timeout = timeout
+	# this property is set by the KademliaNode class when it finds a response
         # from this peer in the incoming message queue
         self.response = None
         # the expected random echo value
@@ -266,7 +265,7 @@ class KademliaNode:
                             peer_addr=req["addr"],
                             own_id=self.id,
                             event_loop=self.event_loop)
-
+        
         rep = None
 
         if req["rpc"] == "PING":
@@ -306,7 +305,8 @@ class KademliaNode:
         initial_kbucket = self.id_to_bucket(str(self.distance(self.id,id)))
         # reply with k nodes
         tmp = deque(self.kbuckets)
-        tmp.rotate(-initial_kbucket)
+        tmp.reverse()
+        tmp.rotate(initial_kbucket+1)
         it = itertools.chain.from_iterable(tmp)
 
         peers = (next(it) for i in range(self.bucket_size))
