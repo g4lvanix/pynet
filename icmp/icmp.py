@@ -30,11 +30,9 @@ class ICMPMessage:
         # pad the bytestring to even length
         if len(bstr)%2:
             bstr += bytes([0])
-
+        
         # calculate 1's-complement sum over the integers
-        cs = 0
-        for i in struct.iter_unpack(">H",bstr):
-            cs += i[0]
+        cs = sum(i[0] for i in struct.iter_unpack(">H",bstr))
         cs = (cs & 0xFFFF) + (cs>>16)
         # return the 1's-complement of the sum i.e. invert all bits 
         return cs^0xFFFF
