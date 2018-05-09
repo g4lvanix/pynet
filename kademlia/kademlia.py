@@ -89,7 +89,7 @@ class KademliaPeer:
         self.alive = alive
         # timeout after which the peer is considered dead after sending a request
         self.timeout = timeout
-	# this property is set by the KademliaNode class when it finds a response
+    # this property is set by the KademliaNode class when it finds a response
         # from this peer in the incoming message queue
         self.response = None
         # the expected random echo value
